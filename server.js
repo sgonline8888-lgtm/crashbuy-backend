@@ -149,6 +149,58 @@ app.get("/api/price/:symbol", async (req, res) => {
   }
 });
 
+// ── Historical price data (for charts) ────────
+// GET /api/history/:symbol?range=1D|1W|1M|3M|6M|YTD|1Y
+// Returns { symbol, range, prices: [[timestampMs, closePrice], ...] }
+const RANGE_MAP = {
+  "1D":  { range: "1d",  interval: "5m"  },
+  "1W":  { range: "5d",  interval: "15m" }, // Yahoo has no literal "7d"; 5 trading days is closest
+  "1M":  { range: "1mo", interval: "1d"  },
+  "3M":  { range: "3mo", interval: "1d"  },
+  "6M":  { range: "6mo", interval: "1d"  },
+  "YTD": { range: "ytd", interval: "1d"  },
+  "1Y":  { range: "1y",  interval: "1d"  },
+};
+
+const historyCache = new Map(); // "symbol:range" -> { data, expiresAt }
+
+app.get("/api/history/:symbol", async (req, res) => {
+  const { symbol } = req.params;
+  const range = (req.query.range || "1M").toUpperCase();
+  const cfg = RANGE_MAP[range];
+  if (!cfg) return res.status(400).json({ error: `Unsupported range "${range}"` });
+
+  const cacheKey = `${symbol}:${range}`;
+  const cached = historyCache.get(cacheKey);
+  if (cached && Date.now() < cached.expiresAt) {
+    return res.json({ symbol, range, prices: cached.data, cached: true });
+  }
+
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${cfg.range}&interval=${cfg.interval}`;
+    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    const data = await r.json();
+    const result = data?.chart?.result?.[0];
+    if (!result) return res.status(404).json({ error: "Symbol not found" });
+
+    const timestamps = result.timestamp || [];
+    const closes = result.indicators?.quote?.[0]?.close || [];
+    const prices = [];
+    for (let i = 0; i < timestamps.length; i++) {
+      if (closes[i] != null) prices.push([timestamps[i] * 1000, closes[i]]);
+    }
+    if (!prices.length) return res.status(404).json({ error: "No historical data" });
+
+    // Intraday ranges refresh fast; daily-bar ranges can cache longer.
+    const ttlMs = range === "1D" ? 60 * 1000 : range === "1W" ? 5 * 60 * 1000 : 60 * 60 * 1000;
+    historyCache.set(cacheKey, { data: prices, expiresAt: Date.now() + ttlMs });
+
+    res.json({ symbol, range, prices });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch history", detail: String(err) });
+  }
+});
+
 // ── Watchlist — dual storage ──────────────────
 app.get("/api/watchlist", async (req, res) => {
   // Primary: local JSON file
